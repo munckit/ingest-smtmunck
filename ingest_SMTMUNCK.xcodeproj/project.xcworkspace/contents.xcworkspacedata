@@ -4,4 +4,18 @@
    <FileRef
       location = "self:">
    </FileRef>
+   <FileRef
+      location = "group:AGENTS.md">
+   </FileRef>
+   <Group
+      location = "group:skills"
+      name = "skills">
+      <Group
+         location = "group:soft-clear"
+         name = "soft-clear">
+         <FileRef
+            location = "group:SKILL.md">
+         </FileRef>
+      </Group>
+   </Group>
 </Workspace>

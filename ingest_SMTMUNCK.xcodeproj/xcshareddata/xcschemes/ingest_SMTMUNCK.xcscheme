@@ -51,6 +51,13 @@
             ReferencedContainer = "container:ingest_SMTMUNCK.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
+      <EnvironmentVariables>
+         <EnvironmentVariable
+            key = "INGEST&#x200b;_&#x200b;VOLUMES&#x200b;_&#x200b;ROOT&#x200b;_&#x200b;PATH"
+            value = "/Users/sysmunck/Documents/temp"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+      </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"

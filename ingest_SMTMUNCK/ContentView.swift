@@ -21,6 +21,9 @@ struct ProductionFolder: Identifiable, Hashable {
 }
 
 struct ContentView: View {
+    private static let defaultVolumesRootPath = "/Volumes"
+    private static let defaultFilmRootPath = "/Volumes/FILM"
+
     @State private var state: AppState = .idle
     @State private var productionFolders: [ProductionFolder] = []
 
@@ -59,9 +62,22 @@ struct ContentView: View {
     @State private var sourceDiskIsSafeToRemove = false
 
     @State private var ignoredDiskPathWhileIdle: String? = nil
+    @State private var hasLoggedStartup = false
+    @State private var isDebugStateLockEnabled = false
 
-    private let filmRootPath = "/Volumes/FILM"
+    private let filmRootPath: String
+    private let volumesRootPath: String
     private let inactivityTimeoutSeconds: TimeInterval = 600
+
+    init() {
+        volumesRootPath = Self.resolvedPath(
+            fromEnvKey: "INGEST_VOLUMES_ROOT_PATH",
+            defaultPath: Self.defaultVolumesRootPath
+        )
+        filmRootPath = URL(fileURLWithPath: volumesRootPath)
+            .appendingPathComponent("FILM")
+            .path
+    }
 
     private var trimmedNewFolderName: String {
         newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -69,6 +85,76 @@ struct ContentView: View {
 
     private var canContinueFromKeyboard: Bool {
         !trimmedNewFolderName.isEmpty
+    }
+
+    private var shouldShowPathDebugInfo: Bool {
+        volumesRootPath != Self.defaultVolumesRootPath
+    }
+
+    private var shouldIgnoreCurrentDiskInIdle: Bool {
+        volumesRootPath == Self.defaultVolumesRootPath
+    }
+
+    private var sourceSearchRoots: [String] {
+        if volumesRootPath == Self.defaultVolumesRootPath {
+            return [Self.defaultVolumesRootPath]
+        }
+
+        var roots: [String] = [volumesRootPath]
+        if volumesRootPath != Self.defaultVolumesRootPath {
+            roots.append(Self.defaultVolumesRootPath)
+        }
+        return roots
+    }
+
+    private static func resolvedPath(fromEnvKey key: String, defaultPath: String) -> String {
+        let environment = ProcessInfo.processInfo.environment
+        let normalizedKey = normalizeEnvKey(key)
+
+        let exactOrNormalizedMatch = environment[key] ?? environment.first { entry in
+            normalizeEnvKey(entry.key) == normalizedKey
+        }?.value
+
+        guard let envValue = exactOrNormalizedMatch?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !envValue.isEmpty else {
+            return defaultPath
+        }
+
+        guard envValue.count > 1, envValue.hasSuffix("/") else {
+            return envValue
+        }
+
+        return String(envValue.dropLast())
+    }
+
+    private static func normalizeEnvKey(_ key: String) -> String {
+        key.uppercased().filter { character in
+            character == "_" || character.isLetter || character.isNumber
+        }
+    }
+
+    private func logStartupIfNeeded() {
+        guard !hasLoggedStartup else { return }
+        hasLoggedStartup = true
+
+        let ingestEnvVars = ProcessInfo.processInfo.environment
+            .filter { entry in
+                entry.key.contains("INGEST") || entry.key.contains("VOLUMES")
+            }
+            .sorted { $0.key < $1.key }
+
+        print("[INGEST] Startup")
+        print("[INGEST] volumesRootPath = \(volumesRootPath)")
+        print("[INGEST] filmRootPath = \(filmRootPath)")
+
+        if ingestEnvVars.isEmpty {
+            print("[INGEST] No INGEST/VOLUMES env vars found in process")
+        } else {
+            for (key, value) in ingestEnvVars {
+                print("[INGEST] ENV \(key)=\(value)")
+            }
+        }
     }
 
     var body: some View {
@@ -97,23 +183,19 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 500)
+        .overlay(alignment: .bottomLeading) {
+            if shouldShowPathDebugInfo {
+                debugPanel
+            }
+        }
         .onAppear {
+            logStartupIfNeeded()
             loadProductionFolders()
             startDiskMonitoring()
             startInactivityTimer()
         }
         .sheet(isPresented: $showCreateFolderSheet) {
             createFolderSheet
-        }
-        .alert("Mappen finns redan", isPresented: $showFolderExistsAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("Det finns redan en produktionsmapp med det namnet, även om den är dold.")
-        }
-        .alert("Kunde inte skapa mapp", isPresented: $showCreateFolderErrorAlert) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text(createFolderErrorMessage)
         }
         .alert("Fel", isPresented: $showTransferErrorAlert) {
             Button("OK", role: .cancel) { }
@@ -217,16 +299,6 @@ struct ContentView: View {
 
     private var doneView: some View {
         ZStack {
-            if !needsManualEject {
-                Color.clear
-                    .ignoresSafeArea()
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        resetInactivityTimer()
-                        resetToIdle(ignoreCurrentDisk: true)
-                    }
-            }
-
             VStack(spacing: 28) {
                 Spacer()
 
@@ -302,11 +374,17 @@ struct ContentView: View {
 
                 if needsManualEject {
                     VStack(spacing: 16) {
+                        Text("För att kunna koppla ur disken\nmåste du trycka på knappen nedan.")
+                            .font(.system(size: 34, weight: .semibold))
+                            .multilineTextAlignment(.center)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 40)
+
                         Button {
                             resetInactivityTimer()
                             manuallyEjectSourceDisk()
                         } label: {
-                            Text("Gör disken klar")
+                            Text("Mata ut disk")
                                 .font(.system(size: 24, weight: .bold))
                                 .foregroundColor(.black)
                                 .frame(minWidth: 260)
@@ -329,6 +407,12 @@ struct ContentView: View {
 
                 Spacer()
             }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !needsManualEject else { return }
+            resetInactivityTimer()
+            resetToIdle(ignoreCurrentDisk: true)
         }
     }
 
@@ -409,6 +493,12 @@ struct ContentView: View {
         .onDisappear {
             cancelSelectionTimeout()
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    resetInactivityTimer()
+                }
+        )
     }
 
     // MARK: - CREATE FOLDER FLOW
@@ -422,6 +512,22 @@ struct ContentView: View {
             }
         }
         .frame(width: 760, height: 560)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    resetInactivityTimer()
+                }
+        )
+        .alert("Mappen finns redan", isPresented: $showFolderExistsAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("Det finns redan en produktionsmapp med det namnet, även om den är dold.")
+        }
+        .alert("Kunde inte skapa mapp", isPresented: $showCreateFolderErrorAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(createFolderErrorMessage)
+        }
     }
 
     private var enterNameContent: some View {
@@ -465,7 +571,6 @@ struct ContentView: View {
                     let trimmed = trimmedNewFolderName
 
                     if folderAlreadyExists(trimmed) {
-                        showCreateFolderSheet = false
                         showFolderExistsAlert = true
                     } else {
                         pendingFolderName = trimmed
@@ -506,6 +611,7 @@ struct ContentView: View {
                         newFolderName = ""
                         pendingFolderName = ""
                     } catch {
+                        print("[INGEST] Failed to create folder '\(pendingFolderName)' in root '\(filmRootPath)': \(error.localizedDescription)")
                         createFolderErrorMessage = error.localizedDescription
                         showCreateFolderErrorAlert = true
                     }
@@ -651,6 +757,12 @@ struct ContentView: View {
 
     private func resetInactivityTimer() {
         startInactivityTimer()
+
+        // While selecting/creating production folder, user activity should
+        // also postpone the 60-second auto-fallback to OSORTERAT.
+        if state == .selectProduction {
+            startSelectionTimeout()
+        }
     }
 
     private func cancelInactivityTimer() {
@@ -674,6 +786,10 @@ struct ContentView: View {
 
         diskMonitoringTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
             DispatchQueue.main.async {
+                if isDebugStateLockEnabled {
+                    return
+                }
+
                 if let ignoredDiskPathWhileIdle,
                    !FileManager.default.fileExists(atPath: ignoredDiskPathWhileIdle) {
                     self.ignoredDiskPathWhileIdle = nil
@@ -712,14 +828,85 @@ struct ContentView: View {
         }
     }
 
+    private var debugPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("DEBUG\nROOT: \(volumesRootPath)\nFILM: \(filmRootPath)")
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundColor(.white)
+
+            HStack(spacing: 6) {
+                debugButton("Idle") { activateDebugState(.idle) }
+                debugButton("Disk") { activateDebugState(.diskDetected) }
+                debugButton("Välj") { activateDebugState(.selectProduction) }
+            }
+
+            HStack(spacing: 6) {
+                debugButton("Överför") { activateDebugState(.transferring) }
+                debugButton("Klar") { activateDebugState(.done, manualEject: false) }
+                debugButton("Gör disk klar") { activateDebugState(.done, manualEject: true) }
+            }
+
+            HStack(spacing: 6) {
+                debugButton("Live-läge") {
+                    isDebugStateLockEnabled = false
+                    resetToIdle(ignoreCurrentDisk: false)
+                    startDiskMonitoring()
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.black.opacity(0.75))
+        .cornerRadius(8)
+        .padding(12)
+    }
+
+    private func debugButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(.black)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.white)
+                .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func activateDebugState(_ targetState: AppState, manualEject: Bool = false) {
+        isDebugStateLockEnabled = true
+        cancelSelectionTimeout()
+        cancelInactivityTimer()
+
+        detectedSourceDiskPath = "\(volumesRootPath)/DEBUG_DISK"
+        detectedSourceVolumeName = "DEBUG_DISK"
+        latestProjectFolderPath = "\(detectedSourceDiskPath ?? "")/PROJEKT_DEBUG"
+        sourceProjectFolderPath = latestProjectFolderPath
+        destinationFolderName = "DEBUG_DESTINATION"
+        destinationFolderPath = "\(filmRootPath)/FILM_DEBUG_DESTINATION"
+
+        completedSourceVolumeName = "DEBUG_DISK"
+        completedSourceProjectName = "PROJEKT_DEBUG"
+        completedSavedInProductionName = "DEBUG_DESTINATION"
+        completedFinalProjectFolderName = "PROJEKT_DEBUG"
+        completedFinalProjectFolderPath = "\(filmRootPath)/FILM_DEBUG_DESTINATION/PROJEKT_DEBUG"
+
+        needsManualEject = manualEject
+        sourceDiskIsSafeToRemove = !manualEject
+
+        state = targetState
+    }
+
     private func cancelDiskMonitoring() {
         diskMonitoringTimer?.invalidate()
         diskMonitoringTimer = nil
     }
 
     private func resetToIdle(ignoreCurrentDisk: Bool) {
-        if ignoreCurrentDisk {
+        if ignoreCurrentDisk && shouldIgnoreCurrentDiskInIdle {
             ignoredDiskPathWhileIdle = detectedSourceDiskPath
+        } else {
+            ignoredDiskPathWhileIdle = nil
         }
 
         detectedSourceDiskPath = nil
@@ -939,22 +1126,38 @@ struct ContentView: View {
 
     private func findSourceDiskPath() -> String? {
         let fileManager = FileManager.default
+        var candidatePaths: [String] = []
 
-        guard let volumeNames = try? fileManager.contentsOfDirectory(atPath: "/Volumes") else {
-            return nil
-        }
+        for root in sourceSearchRoots {
+            let rootURL = URL(fileURLWithPath: root)
+            let systemVolumePath = rootURL.appendingPathComponent("Macintosh HD").path
 
-        let candidatePaths = volumeNames
-            .map { "/Volumes/\($0)" }
-            .filter { path in
-                path != filmRootPath &&
-                path != "/Volumes/Macintosh HD" &&
-                path != ignoredDiskPathWhileIdle
+            guard let volumeNames = try? fileManager.contentsOfDirectory(atPath: root) else {
+                print("[INGEST] Cannot read source root: \(root)")
+                continue
             }
+
+            let rootCandidates = volumeNames
+                .map { rootURL.appendingPathComponent($0).path }
+                .filter { path in
+                    path != filmRootPath &&
+                    path != Self.defaultFilmRootPath &&
+                    path != systemVolumePath &&
+                    path != ignoredDiskPathWhileIdle
+                }
+
+            candidatePaths.append(contentsOf: rootCandidates)
+        }
 
         var candidatesWithDate: [(path: String, date: Date)] = []
 
         for path in candidatePaths {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else {
+                continue
+            }
+
             if let attributes = try? fileManager.attributesOfItem(atPath: path),
                let creationDate = attributes[.creationDate] as? Date {
                 candidatesWithDate.append((path: path, date: creationDate))
@@ -962,6 +1165,9 @@ struct ContentView: View {
         }
 
         let sorted = candidatesWithDate.sorted { $0.date > $1.date }
+        print("[INGEST] Source search roots: \(sourceSearchRoots)")
+        print("[INGEST] Source candidates: \(candidatePaths)")
+        print("[INGEST] Selected source disk: \(sorted.first?.path ?? "none")")
         return sorted.first?.path
     }
 
@@ -1075,6 +1281,16 @@ struct ContentView: View {
         let fileManager = FileManager.default
         let serverFolderName = buildServerFolderName(from: userInput)
         let fullPath = "\(filmRootPath)/\(serverFolderName)"
+
+        print("[INGEST] Create request userInput='\(userInput)' serverFolder='\(serverFolderName)'")
+        print("[INGEST] Ensuring film root exists at: \(filmRootPath)")
+        print("[INGEST] Creating directory at: \(fullPath)")
+
+        try fileManager.createDirectory(
+            atPath: filmRootPath,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
 
         try fileManager.createDirectory(
             atPath: fullPath,
