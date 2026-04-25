@@ -64,12 +64,17 @@ struct ContentView: View {
     @State private var ignoredDiskPathWhileIdle: String? = nil
     @State private var hasLoggedStartup = false
     @State private var isDebugStateLockEnabled = false
+    @State private var isSourceInspectionInProgress = false
+    @State private var sourceInspectionToken: Int = 0
+    @State private var lastSourceInspectionAt: Date? = nil
 
     private let filmRootPath: String
     private let volumesRootPath: String
     private let inactivityTimeoutSeconds: TimeInterval = 600
+    private let sourceInspectionMinIntervalSeconds: TimeInterval = 10
 
     init() {
+#if DEBUG
         volumesRootPath = Self.resolvedPath(
             fromEnvKey: "INGEST_VOLUMES_ROOT_PATH",
             defaultPath: Self.defaultVolumesRootPath
@@ -77,6 +82,10 @@ struct ContentView: View {
         filmRootPath = URL(fileURLWithPath: volumesRootPath)
             .appendingPathComponent("FILM")
             .path
+#else
+        volumesRootPath = Self.defaultVolumesRootPath
+        filmRootPath = Self.defaultFilmRootPath
+#endif
     }
 
     private var trimmedNewFolderName: String {
@@ -88,7 +97,11 @@ struct ContentView: View {
     }
 
     private var shouldShowPathDebugInfo: Bool {
+#if DEBUG
         volumesRootPath != Self.defaultVolumesRootPath
+#else
+        false
+#endif
     }
 
     private var shouldIgnoreCurrentDiskInIdle: Bool {
@@ -664,7 +677,6 @@ struct ContentView: View {
     }
 
     private func refreshSourceProjectFolderBeforeTransfer() {
-        inspectSourceDiskAndLatestProject()
         sourceProjectFolderPath = latestProjectFolderPath
     }
 
@@ -801,7 +813,9 @@ struct ContentView: View {
                     if let sourceDiskPath = findSourceDiskPath() {
                         detectedSourceDiskPath = sourceDiskPath
                         detectedSourceVolumeName = extractVolumeName(from: sourceDiskPath)
+                        latestProjectFolderPath = nil
                         state = .diskDetected
+                        requestSourceInspection(force: true)
                         resetInactivityTimer()
                     }
                 }
@@ -809,6 +823,7 @@ struct ContentView: View {
                 if state == .diskDetected {
                     if let currentDisk = detectedSourceDiskPath,
                        !FileManager.default.fileExists(atPath: currentDisk) {
+                        cancelSourceInspection()
                         detectedSourceDiskPath = nil
                         detectedSourceVolumeName = nil
                         latestProjectFolderPath = nil
@@ -816,19 +831,14 @@ struct ContentView: View {
                         return
                     }
 
-                    inspectSourceDiskAndLatestProject()
-
-                    if latestProjectFolderPath != nil {
-                        loadProductionFolders()
-                        state = .selectProduction
-                        resetInactivityTimer()
-                    }
+                    requestSourceInspection()
                 }
             }
         }
     }
 
     private var debugPanel: some View {
+#if DEBUG
         VStack(alignment: .leading, spacing: 8) {
             Text("DEBUG\nROOT: \(volumesRootPath)\nFILM: \(filmRootPath)")
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -858,9 +868,13 @@ struct ContentView: View {
         .background(Color.black.opacity(0.75))
         .cornerRadius(8)
         .padding(12)
+#else
+        EmptyView()
+#endif
     }
 
     private func debugButton(_ title: String, action: @escaping () -> Void) -> some View {
+#if DEBUG
         Button(action: action) {
             Text(title)
                 .font(.system(size: 11, weight: .bold))
@@ -871,9 +885,13 @@ struct ContentView: View {
                 .cornerRadius(6)
         }
         .buttonStyle(.plain)
+#else
+        EmptyView()
+#endif
     }
 
     private func activateDebugState(_ targetState: AppState, manualEject: Bool = false) {
+#if DEBUG
         isDebugStateLockEnabled = true
         cancelSelectionTimeout()
         cancelInactivityTimer()
@@ -895,6 +913,7 @@ struct ContentView: View {
         sourceDiskIsSafeToRemove = !manualEject
 
         state = targetState
+#endif
     }
 
     private func cancelDiskMonitoring() {
@@ -903,6 +922,8 @@ struct ContentView: View {
     }
 
     private func resetToIdle(ignoreCurrentDisk: Bool) {
+        cancelSourceInspection()
+
         if ignoreCurrentDisk && shouldIgnoreCurrentDiskInIdle {
             ignoredDiskPathWhileIdle = detectedSourceDiskPath
         } else {
@@ -1105,30 +1126,79 @@ struct ContentView: View {
 
     // MARK: - DISK + PROJECT DETECTION
 
-    private func inspectSourceDiskAndLatestProject() {
-        if detectedSourceDiskPath == nil {
-            detectedSourceDiskPath = findSourceDiskPath()
-        }
+    private func requestSourceInspection(force: Bool = false) {
+        guard state == .diskDetected else { return }
+        guard !isSourceInspectionInProgress else { return }
 
-        detectedSourceVolumeName = extractVolumeName(from: detectedSourceDiskPath)
-
-        latestProjectFolderPath = nil
-        sourceProjectFolderPath = nil
-
-        guard let sourceDiskPath = detectedSourceDiskPath else {
+        if !force,
+           let lastSourceInspectionAt,
+           Date().timeIntervalSince(lastSourceInspectionAt) < sourceInspectionMinIntervalSeconds {
             return
         }
 
-        if let latestFolder = findLatestProjectFolder(in: sourceDiskPath) {
-            latestProjectFolderPath = latestFolder
+        isSourceInspectionInProgress = true
+        sourceInspectionToken += 1
+        let token = sourceInspectionToken
+
+        let currentDetectedDiskPath = detectedSourceDiskPath
+        let currentIgnoredPath = ignoredDiskPathWhileIdle
+        let currentSearchRoots = sourceSearchRoots
+        let currentFilmRootPath = filmRootPath
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let resolvedSourceDiskPath = currentDetectedDiskPath ?? Self.findSourceDiskPath(
+                searchRoots: currentSearchRoots,
+                filmRootPath: currentFilmRootPath,
+                ignoredDiskPathWhileIdle: currentIgnoredPath
+            )
+
+            let resolvedVolumeName = self.extractVolumeName(from: resolvedSourceDiskPath)
+            let resolvedLatestProjectFolderPath = resolvedSourceDiskPath.flatMap { self.findLatestProjectFolder(in: $0) }
+
+            DispatchQueue.main.async {
+                guard token == self.sourceInspectionToken else { return }
+
+                self.isSourceInspectionInProgress = false
+                self.lastSourceInspectionAt = Date()
+
+                guard self.state == .diskDetected else { return }
+
+                self.detectedSourceDiskPath = resolvedSourceDiskPath
+                self.detectedSourceVolumeName = resolvedVolumeName
+                self.latestProjectFolderPath = resolvedLatestProjectFolderPath
+
+                if resolvedLatestProjectFolderPath != nil {
+                    self.loadProductionFolders()
+                    self.state = .selectProduction
+                    self.resetInactivityTimer()
+                }
+            }
         }
     }
 
+    private func cancelSourceInspection() {
+        sourceInspectionToken += 1
+        isSourceInspectionInProgress = false
+        lastSourceInspectionAt = nil
+    }
+
     private func findSourceDiskPath() -> String? {
+        Self.findSourceDiskPath(
+            searchRoots: sourceSearchRoots,
+            filmRootPath: filmRootPath,
+            ignoredDiskPathWhileIdle: ignoredDiskPathWhileIdle
+        )
+    }
+
+    private static func findSourceDiskPath(
+        searchRoots: [String],
+        filmRootPath: String,
+        ignoredDiskPathWhileIdle: String?
+    ) -> String? {
         let fileManager = FileManager.default
         var candidatePaths: [String] = []
 
-        for root in sourceSearchRoots {
+        for root in searchRoots {
             let rootURL = URL(fileURLWithPath: root)
             let systemVolumePath = rootURL.appendingPathComponent("Macintosh HD").path
 
@@ -1165,7 +1235,7 @@ struct ContentView: View {
         }
 
         let sorted = candidatesWithDate.sorted { $0.date > $1.date }
-        print("[INGEST] Source search roots: \(sourceSearchRoots)")
+        print("[INGEST] Source search roots: \(searchRoots)")
         print("[INGEST] Source candidates: \(candidatePaths)")
         print("[INGEST] Selected source disk: \(sorted.first?.path ?? "none")")
         return sorted.first?.path
@@ -1178,7 +1248,7 @@ struct ContentView: View {
             return nil
         }
 
-        var folderInfos: [(path: String, modificationDate: Date)] = []
+        var folderInfos: [(path: String, latestContentDate: Date)] = []
 
         for itemName in itemNames {
             if shouldIgnoreSourceFolder(named: itemName) {
@@ -1193,19 +1263,46 @@ struct ContentView: View {
                 continue
             }
 
-            guard let attributes = try? fileManager.attributesOfItem(atPath: fullPath),
-                  let modificationDate = attributes[.modificationDate] as? Date else {
-                continue
-            }
+            let latestContentDate = latestModificationDateRecursively(in: fullPath)
 
-            folderInfos.append((path: fullPath, modificationDate: modificationDate))
+            folderInfos.append((path: fullPath, latestContentDate: latestContentDate))
         }
 
         let sortedFolders = folderInfos.sorted { lhs, rhs in
-            lhs.modificationDate > rhs.modificationDate
+            lhs.latestContentDate > rhs.latestContentDate
         }
 
         return sortedFolders.first?.path
+    }
+
+    private func latestModificationDateRecursively(in folderPath: String) -> Date {
+        let fileManager = FileManager.default
+        let folderURL = URL(fileURLWithPath: folderPath)
+
+        var latestDate = (
+            (try? fileManager.attributesOfItem(atPath: folderPath)[.modificationDate] as? Date) ?? .distantPast
+        )
+
+        guard let enumerator = fileManager.enumerator(
+            at: folderURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return latestDate
+        }
+
+        for case let itemURL as URL in enumerator {
+            guard let values = try? itemURL.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let modificationDate = values.contentModificationDate else {
+                continue
+            }
+
+            if modificationDate > latestDate {
+                latestDate = modificationDate
+            }
+        }
+
+        return latestDate
     }
 
     private func shouldIgnoreSourceFolder(named folderName: String) -> Bool {
